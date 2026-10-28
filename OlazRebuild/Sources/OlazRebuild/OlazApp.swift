@@ -20,6 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.start()
+        // A bare SwiftPM executable is not a regular app until told so: no key window, no Dock icon.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate()
         do {
             let runtime = try RuntimeInstaller.locate()
             Log.write("runtime \(runtime.version ?? "?") at \(runtime.asar.path)")

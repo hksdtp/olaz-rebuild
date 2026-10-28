@@ -16,6 +16,8 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         config.httpShouldSetCookies = true
         config.httpCookieAcceptPolicy = .always
         config.timeoutIntervalForRequest = 60
+        // main.js `webContents.setUserAgent("ZaloPC-" + platform + "-" + clientType + "v" + clientVersion)`.
+        config.httpAdditionalHeaders = ["User-Agent": "ZaloPC-darwin-23v694"]
         session = URLSession(configuration: config)
         super.init()
     }
@@ -133,6 +135,18 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         if let protocols = body["protocols"] as? [String], !protocols.isEmpty {
             request.setValue(protocols.joined(separator: ","), forHTTPHeaderField: "Sec-WebSocket-Protocol")
         }
+        // The Electron page lives at file://; the chat socket answers 403 without an Origin.
+        request.setValue("file://", forHTTPHeaderField: "Origin")
+        // URLSession leaves the cookie jar out of WebSocket handshakes; Electron sends zpw_sek.
+        var cookieURL = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        cookieURL?.scheme = url.scheme == "ws" ? "http" : "https"
+        if let lookup = cookieURL?.url, let cookies = HTTPCookieStorage.shared.cookies(for: lookup), !cookies.isEmpty {
+            for (key, value) in HTTPCookie.requestHeaderFields(with: cookies) {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        } else {
+            Log.write("ws#\(id) no cookies for \(url.host ?? "")")
+        }
         let task = session.webSocketTask(with: request)
         lock.lock(); sockets[id] = task; lock.unlock()
         task.resume()
@@ -145,6 +159,9 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
             guard let self else { return }
             switch result {
             case .success(let message):
+                if ProcessInfo.processInfo.environment["OLAZ_TRACE_NET"] != nil {
+                    Log.write(String("net ws#\(id) in \(message)".prefix(120)))
+                }
                 switch message {
                 case .string(let text):
                     self.emit(["id": id, "type": "text", "payload": ["text": text]])
@@ -155,6 +172,8 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
                 }
                 self.receive(id: id, task: task)
             case .failure(let error):
+                let status = (task.response as? HTTPURLResponse)?.statusCode ?? -1
+                Log.write("ws#\(id) closed: \(error.localizedDescription) (http \(status))")
                 self.emit(["id": id, "type": "close", "payload": ["code": 1006, "reason": "\(error)", "wasClean": false]])
                 self.lock.lock(); self.sockets[id] = nil; self.lock.unlock()
             }
@@ -180,9 +199,10 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     /// `window.__zaloNet.socketEvent(id, type, payload)`.
-    private func emit(_ payload: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-        let script = "window.__zaloNet && window.__zaloNet.socketEvent(\(String(decoding: data, as: UTF8.self)))"
+    private func emit(_ event: [String: Any]) {
+        guard let id = event["id"] as? Int, let type = event["type"] as? String,
+              let data = try? JSONSerialization.data(withJSONObject: event["payload"] ?? [:]) else { return }
+        let script = "window.__zaloNet && window.__zaloNet.socketEvent(\(id), \"\(type)\", \(String(decoding: data, as: UTF8.self)))"
         DispatchQueue.main.async { [weak self] in
             self?.webView?.evaluateJavaScript(script, completionHandler: nil)
         }

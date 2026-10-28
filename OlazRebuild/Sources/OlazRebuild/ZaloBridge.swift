@@ -20,8 +20,10 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
     init(archive: AsarArchive, table: [String: Any]) {
         self.archive = archive
         self.table = table
+        // Own userData, like the original's Olaz/ZaloData: the real Zalo PC may be running on
+        // ~/Library/Application Support/ZaloData, and its SQLite-migrated state is unusable here.
         self.support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ZaloData", isDirectory: true)
+            .appendingPathComponent("OlazRebuild/ZaloData", isDirectory: true)
         super.init()
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
     }
@@ -79,7 +81,7 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private static func inventory() -> [String: Any] {
-        guard let url = Bundle.module.url(forResource: "members", withExtension: "json", subdirectory: "Resources"),
+        guard let url = resourceBundle.url(forResource: "members", withExtension: "json", subdirectory: "Resources"),
               let data = try? Data(contentsOf: url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
         return root
@@ -87,7 +89,7 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
 
     /// Namespace members recovered from the binary's bridge registration strings.
     private static func extraMembers() -> [String] {
-        guard let url = Bundle.module.url(forResource: "members", withExtension: "json", subdirectory: "Resources"),
+        guard let url = resourceBundle.url(forResource: "members", withExtension: "json", subdirectory: "Resources"),
               let data = try? Data(contentsOf: url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let list = root["members"] as? [String] else { return [] }
@@ -288,9 +290,9 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
         case "sqlite-available":
             return false
         case "is-migrate-full-done":
-            // `migrateDB.isMigrateFullDone()` is the only thing the migrate screen waits on;
-            // this host never migrates to SQLite, so it is always done.
-            return true
+            // main.js `migrateFullyDone` = config.json `migrate_full_done`. Never fake `true`: the
+            // renderer then treats IndexedDB as migrated, drops it and talks to a SQLite host.
+            return Self.readStore(name: "config", root: support)["migrate_full_done"] as? Bool ?? false
         case "migratedb:check_need_wait_bu":
             return false
         case "get-migrate-local-info":
@@ -359,9 +361,9 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
         }
     }
 
-    /// electron-store: one JSON file per store under Electron's `userData`, which is
-    /// the same `ZaloData` directory the official client uses.
-    private static let storeLock = NSLock()
+    /// electron-store: one JSON file per store under Electron's `userData`.
+    // Recursive: writeStore merges through readStore while holding it.
+    private static let storeLock = NSRecursiveLock()
 
     static func storeURL(name: String, root: URL) -> URL {
         root.appendingPathComponent("\(name).json")
@@ -408,7 +410,9 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
         var fields: [HTTPCookiePropertyKey: Any] = [
             .name: name,
             .value: value,
-            .domain: domain,
+            // Electron's explicit `domain` makes a domain cookie (ws*-msg.chat.zalo.me needs it);
+            // Foundation only does that with the leading dot.
+            .domain: domain.hasPrefix(".") ? domain : "." + domain,
             .path: "/",
             .secure: "TRUE",
             .expires: Date().addingTimeInterval(lifetime),

@@ -4,7 +4,8 @@ Rebuilt from `Olaz-1.0.dmg` (Olaz 1.0, signed `app.olaz.mac`, Team 85632Z2M2Q).
 The original is a Swift/AppKit shell (21.2 MB, 80 Swift files, ~309 types) that runs
 the **official Zalo PC 26.10.20 Electron renderer** inside `WKWebView` and re-implements
 the Electron preload bridge in Swift. This tree rebuilds that shell with the same
-three-part split, ~1.7k lines of Swift.
+three-part split, ~2.1k lines of Swift, plus a native SwiftUI chat UI on top of the
+hidden renderer (the original's model).
 
 ## Evidence the design is derived from
 
@@ -32,8 +33,9 @@ Sources/OlazRebuild/
   RendererHost.swift     WKWebView, user scripts, message handlers, entry-page choice
   ZaloBridge.swift       main-process emulation: spec, IPC invoke, $znode/$zelectron members
   NetworkProxy.swift     http(s) via URLSession (cookie jar), ws via URLSessionWebSocketTask
-  ShellState.swift       snapshots pushed by the adapters
-  RootView.swift         SwiftUI shell: QR login, renderer pane, sign-out
+  ShellState.swift       snapshots pushed by the adapters (user, conversations, chat, login)
+  RootView.swift         hidden renderer + native QR login
+  ChatViews.swift        native conversation list, chat, composer (calls window.__zaloChat)
   SharedWorkerHost.swift second WKWebView running shared-worker.html; relays tasks
   ZaloCrypto.swift       $znode.crypto encrypt/decrypt (CryptoKit AES-GCM)
   Resources/dist/        Olaz host scripts + bridge-table.json, verbatim from the DMG
@@ -43,14 +45,18 @@ Sources/OlazRebuild/
 ## Run
 
 ```sh
-OLAZ_RUNTIME="$HOME/Library/Application Support/Olaz/ZaloRuntime/current" \
-  swift run OlazRebuild
+./build-app.sh                      # → "Olaz Rebuild.app" (release, ad-hoc signed)
+open "Olaz Rebuild.app"
+# or, for development:
+cd OlazRebuild && swift run OlazRebuild
 ```
 
-Needs a Zalo PC runtime that Olaz already installed (or point `OLAZ_RUNTIME` at a
-Zalo.app with `Contents/Resources/app.asar`). Debug: `OLAZ_PROBE=1`,
-`OLAZ_TRACE_ASAR=1`, `OLAZ_TRACE_BRIDGE=1`, `OLAZ_TRACE_NET=1`, `OLAZ_TRACE_IPC=1`.
-Log: `~/Library/Application Support/OlazRebuild/engine.log`.
+Needs a Zalo PC runtime that Olaz already installed at
+`~/Library/Application Support/Olaz/ZaloRuntime/current` (or point `OLAZ_RUNTIME` at a
+Zalo.app with `Contents/Resources/app.asar`). The app keeps its own Electron `userData`
+in `~/Library/Application Support/OlazRebuild/ZaloData` and never touches the real Zalo
+PC's `ZaloData`. Debug: `OLAZ_PROBE=1`, `OLAZ_TRACE_ASAR=1`, `OLAZ_TRACE_BRIDGE=1`,
+`OLAZ_TRACE_NET=1`, `OLAZ_TRACE_IPC=1`. Log: `~/Library/Application Support/OlazRebuild/engine.log`.
 
 ## Verified (runtime, this machine)
 
@@ -67,21 +73,29 @@ Log: `~/Library/Application Support/OlazRebuild/engine.log`.
 - Real QR login works: phone scan → server issues `zpw_sek`, authenticated
   APIs answer 200 (`getLoginInfo`, `usage-mycloud`, `getCloudViewerKey`).
 - Shared worker page boots and registers its 26 task types.
+- Logged-in main page fully boots: IndexedDB opens (`zdb_<uid>` v76 …), chat
+  WebSocket handshakes and receives sync frames, conversations/friends/groups load.
+- Native UI: conversation list with avatars, previews, unread badges; opening a chat
+  shows its history (text and photos); sending a text from the native composer works
+  (tested in "My Documents" only). The packaged .app boots to the native QR login.
 
-## Status: NOT finished
+## Fixes that unblocked the main page
 
-After login the main page stays on "Đang đăng nhập..." with an empty Redux
-`user` slice. Root cause traced, not fixed: `SecureLocalStorage` is never
-initialised (`init(userId, UIN)` runs from the `Authenticating` lifecycle event,
-which needs the session handed over by the main process — `new-session` /
-DAL channels `db-client-connected`, `get-name-of-target-script-for-dal-channel-from-host`,
-`fail-load-sqlite3` are not emulated yet). Native SwiftUI on top of the adapters
-(option B) is blocked on this.
+- Chat WebSocket: `Origin: file://` (403 without it) and the session cookies attached to
+  the handshake; socket events delivered as `socketEvent(id, type, payload)`; one
+  `NetworkProxy` per web view (socket ids collide between the page and the worker).
+- Own `userData` directory and `is-migrate-full-done` read from its `config.json`:
+  faking `true` made the renderer drop IndexedDB and wait for a SQLite DAL host forever.
+- electron-store lock made recursive (`writeStore` → `readStore` deadlocked the UI thread).
+- Cookies set as domain cookies (`.zalo.me`), matching Electron's explicit `domain`.
+- Renderer container never takes clicks or keyboard focus from the native UI.
 
 ## Not rebuilt (out of scope, deliberately)
 
-- Native chat UI (80 SwiftUI/AppKit files in the original). Here the renderer is
-  shown directly instead — same product surface, no re-implementation.
+- Most of the original's native surface: stickers, polls, reactions, media viewer,
+  calls, contact management, group creation, labels, stranger folder, notifications
+  UI. Their shipped adapters are injected (they load without errors) but have no
+  native views here; only text, photo history and text sending do.
 - Native call helper (`ZaloCall`), screen capture (`ZaloCap`) spawn paths.
 - Runtime download/install flow (`ZaloRuntimeInstaller`, VNG DMG fetch + signature check).
 - SQLite host migration: the official renderer is told to stay on IndexedDB, as the

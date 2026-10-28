@@ -36,7 +36,8 @@ final class RendererHost: NSObject {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = Self.userAgent
         webView.navigationDelegate = self
-        webView.alphaValue = 1
+        // Runs behind the native UI, like the original: invisible but laid out and live.
+        webView.alphaValue = 0
         self.webView = webView
         bridge.attach(webView: webView)
         network.attach(webView: webView)
@@ -45,6 +46,10 @@ final class RendererHost: NSObject {
 
         bridge.onLoginSuccess = { [weak self] in self?.openMainPage() }
         bridge.onSessionCleared = { [weak self] in self?.returnToLogin() }
+        // Sessions saved before domain cookies were used are host-only; widen them once.
+        let hostOnly = (HTTPCookieStorage.shared.cookies ?? []).filter { $0.name == "zpw_sek" && !$0.domain.hasPrefix(".") }
+        hostOnly.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
+        if let secret = hostOnly.first?.value { ZaloBridge.storeAppCookie(secret) }
         // main-dist/main.js: "cookie found, load main" - zpw_sek decides the page.
         let page = Self.hasSession() ? "index.html" : "login.html"
         Log.write("opening \(page) (zpw_sek: \(Self.hasSession()))")
@@ -67,6 +72,20 @@ final class RendererHost: NSObject {
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         store.removeData(ofTypes: types, modifiedSince: .distantPast) { [weak self] in
             Task { @MainActor in self?.returnToLogin() }
+        }
+    }
+
+    /// Runs `body` as an async function in the page (arguments become locals), e.g.
+    /// `run("return await window.__zaloChat.open(id)", ["id": convId])`.
+    @MainActor
+    @discardableResult
+    func run(_ body: String, _ arguments: [String: Any] = [:]) async -> Any? {
+        guard let webView else { return nil }
+        do {
+            return try await webView.callAsyncJavaScript(body, arguments: arguments, contentWorld: .page)
+        } catch {
+            Log.write("js failed: \(error.localizedDescription) [\(body.prefix(60))]")
+            return nil
         }
     }
 
@@ -100,7 +119,9 @@ final class RendererHost: NSObject {
             Log.write("sw-zlog \(message)")
             return nil
         }, name: "zlog")
-        controller.addScriptMessageHandler(network!, contentWorld: .page, name: "znet")
+        // Own proxy: socket ids restart at 1 per page and events must reach the page that opened them.
+        let network = NetworkProxy()
+        controller.addScriptMessageHandler(network, contentWorld: .page, name: "znet")
         for (file, name) in [(nil, "spec"), ("local-modules", "local"), ("bridge", "bridge"), ("network-shim", "net"), ("instrument", "instrument")] {
             var body = bridge?.specScript() ?? ""
             if let file, let url = hostScriptURL(file),
@@ -118,7 +139,7 @@ final class RendererHost: NSObject {
         bridge?.attach(worker: host, page: page)
 
         web.navigationDelegate = self
-        network?.attach(webView: web)
+        network.attach(webView: web)
         web.load(URLRequest(url: Self.pageURL("shared-worker.html")))
         Log.write("shared worker page loading")
     }
@@ -149,7 +170,7 @@ final class RendererHost: NSObject {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
 
     private func loadTable() throws -> [String: Any] {
-        guard let url = Bundle.module.url(forResource: "bridge-table", withExtension: "json", subdirectory: "Resources/dist") else {
+        guard let url = resourceBundle.url(forResource: "bridge-table", withExtension: "json", subdirectory: "Resources/dist") else {
             throw RuntimeError("bridge-table.json missing")
         }
         let data = try Data(contentsOf: url)
@@ -370,6 +391,11 @@ final class ScriptMessageProxy: NSObject, WKScriptMessageHandler {
 
 // Scripts shipped verbatim by Olaz live in Resources/dist; our own ones sit beside it.
 private func hostScriptURL(_ name: String) -> URL? {
-    Bundle.module.url(forResource: name, withExtension: "js", subdirectory: "Resources/dist")
-        ?? Bundle.module.url(forResource: name, withExtension: "js", subdirectory: "Resources")
+    resourceBundle.url(forResource: name, withExtension: "js", subdirectory: "Resources/dist")
+        ?? resourceBundle.url(forResource: name, withExtension: "js", subdirectory: "Resources")
 }
+
+/// SwiftPM's `Bundle.module` only looks at the .app root, where codesign refuses files;
+/// the packaged app (build-app.sh) keeps the resource bundle in Contents/Resources.
+let resourceBundle: Bundle = Bundle.main.url(forResource: "OlazRebuild_OlazRebuild", withExtension: "bundle")
+    .flatMap(Bundle.init(url:)) ?? .module

@@ -1,42 +1,79 @@
 import SwiftUI
 import WebKit
 
-/// The official renderer is the app UI: it *is* Zalo PC's interface. The native
-/// shell only hosts it and reports the page it is on.
+/// Native shell over the hidden official renderer: the adapters push state into
+/// `ShellState`, the views call back into the page through `RendererHost.run`.
 struct RootView: View {
     @ObservedObject var state: ShellState
     let host: RendererHost
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack {
             RendererPane(host: host).id(state.rendererReady)
-            statusBar
-        }
-    }
-
-    private var statusBar: some View {
-        HStack(spacing: 8) {
-            if let failure = state.failure {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                Text(failure).font(.caption).lineLimit(2)
-            } else {
-                Text(state.page).font(.caption).foregroundStyle(.secondary)
-                if !state.userName.isEmpty {
-                    Text(state.userName).font(.caption)
-                }
-                if !state.conversations.isEmpty {
-                    Text("\(state.conversations.count) hội thoại").font(.caption).foregroundStyle(.secondary)
+            Group {
+                if state.page == "main" {
+                    MainView(state: state, host: host)
+                } else {
+                    LoginView(state: state, host: host)
                 }
             }
-            Spacer()
-            Button("Đăng xuất") { host.signOut() }
-                .font(.caption)
-                .buttonStyle(.link)
-                .disabled(state.page == "login")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
-        .background(.bar)
+    }
+}
+
+/// The official QR login, drawn from the login page snapshot (state-adapter.js).
+private struct LoginView: View {
+    @ObservedObject var state: ShellState
+    let host: RendererHost
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Text("Đăng nhập Zalo").font(.title2.bold())
+            ZStack {
+                if let qr = state.login?.qr, let image = Self.image(dataURL: qr) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .opacity(state.login?.invalid == true ? 0.25 : 1)
+                } else {
+                    ProgressView()
+                }
+            }
+            .frame(width: 240, height: 240)
+            .background(.white, in: RoundedRectangle(cornerRadius: 12))
+
+            Text(state.login?.text ?? "Đang tải mã QR…")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 380)
+
+            HStack {
+                // The official page's own buttons ("Lấy mã mới", …), clicked inside the renderer.
+                ForEach(state.login?.buttons ?? [], id: \.self) { label in
+                    Button(label) {
+                        Task { await host.run("return window.__zaloLoginAction(label)", ["label": label]) }
+                    }
+                }
+            }
+            if let failure = state.failure {
+                Label(failure, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+            }
+        }
+        .padding(32)
+    }
+
+    static func image(dataURL: String) -> NSImage? {
+        guard let comma = dataURL.firstIndex(of: ","), dataURL.hasPrefix("data:") else { return nil }
+        let header = dataURL[..<comma]
+        let payload = String(dataURL[dataURL.index(after: comma)...])
+        let data = header.hasSuffix(";base64")
+            ? Data(base64Encoded: payload)
+            : payload.removingPercentEncoding.map { Data($0.utf8) }
+        return data.flatMap(NSImage.init(data:))
     }
 }
 
@@ -46,7 +83,7 @@ private struct RendererPane: NSViewRepresentable {
     let host: RendererHost
 
     func makeNSView(context: Context) -> NSView {
-        let container = NSView()
+        let container = PassthroughView()
         container.wantsLayer = true
         attach(into: container)
         return container
@@ -70,4 +107,10 @@ private struct RendererPane: NSViewRepresentable {
             web.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
     }
+}
+
+/// SwiftUI draws into layers, so AppKit hit-testing would hand clicks (and with them
+/// keyboard focus) to the invisible renderer underneath. It never takes input.
+private final class PassthroughView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
